@@ -205,7 +205,7 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
     return {
         "scheme": "exact",
         "network": "base",
-        "maxAmountRequired": amount_str,  # <-- FIXED: must be string
+        "maxAmountRequired": f"{Decimal(price):.6f}",
         "resource": resource_url,
         "description": description_by_kind.get(kind, ""),
         "mimeType": "application/json",
