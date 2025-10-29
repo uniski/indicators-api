@@ -25,7 +25,7 @@ SUPPORTED_INTERVALS = {"1m", "5m", "15m", "1h", "4h", "1d"}
 # x402 config (Render env overrides these)
 X402_ENABLED = os.getenv("X402_ENABLED", "false").lower() == "true"
 X402_CHAIN = os.getenv("X402_CHAIN", "base")     # base mainnet by default
-X402_ASSET = os.getenv("X402_ASSET", "USDC")
+X402_ASSET = os.getenv("X402_ASSET", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
 X402_RECEIVER = os.getenv("X402_RECEIVER", "")
 X402_PRICE_BASIC = os.getenv("X402_PRICE_BASIC", "0.005")
 X402_PRICE_PRO = os.getenv("X402_PRICE_PRO", "0.010")
@@ -176,11 +176,11 @@ def meta(df: pd.DataFrame, symbol: str, exchange: str, interval: str):
 # ---------- x402 helpers ----------
 def _normalize_amount(price: str) -> str:
     """
-    Sanitize env-provided price into a strict decimal STRING for x402scan:
+    Sanitize env-provided price into atomic units STRING for x402scan (USDC has 6 decimals):
     - strips stray quotes/spaces
     - parses as Decimal
     - must be > 0
-    - formats as 6-decimal string (no exponent)
+    - multiplies by 10**6 and converts to int string
     """
     s = str(price).strip()
     if s.startswith(("'", '"')) and s.endswith(("'", '"')) and len(s) >= 2:
@@ -191,7 +191,8 @@ def _normalize_amount(price: str) -> str:
         raise HTTPException(500, "Invalid x402 price format")
     if d <= 0:
         raise HTTPException(500, "x402 price must be > 0")
-    return f"{d:.6f}"
+    atomic = int(d * Decimal('1000000'))
+    return str(atomic)
 
 def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
     resource_url = str(request.url)
@@ -229,7 +230,7 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
         }
     else:  # candles
         output_schema = {
-            "meta": {"symbol": "string", "exchange": "string", "interval": "string", "returned_interval": "string", "candles": "number", "last_candle_iso": "string|null"},
+            "meta": {"symbol": "string", "exchange": "string", "interval": "string", "candles": "number", "last_candle_iso": "string|null"},
             "candles": [{"ts": "string", "open": "number", "high": "number", "low": "number", "close": "number", "volume": "number"}],
         }
         # allow optional resample in input for /v1/candles
@@ -237,8 +238,8 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
 
     return {
         "scheme": "exact",
-        "network": "base",
-        "maxAmountRequired": amount_str,  # STRING per x402scan
+        "network": X402_CHAIN,
+        "maxAmountRequired": amount_str,  # STRING per x402scan, in atomic units
         "resource": resource_url,
         "description": description_by_kind.get(kind, ""),
         "mimeType": "application/json",
@@ -246,7 +247,7 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
         "maxTimeoutSeconds": 300,
         "asset": X402_ASSET,
         "outputSchema": {"input": {"type": "http", "method": "GET", "queryParams": query_schema}, "output": output_schema},
-        "extra": {"tier": kind},
+        "extra": {"name": "transferWithAuthorization", "version": "1", "tier": kind},
     }
 
 def _x402_response(kind: str, request: Request, price: str) -> Dict[str, Any]:
