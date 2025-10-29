@@ -1,6 +1,7 @@
 import json, os
 from typing import Dict, Any
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 import ccxt
 import pandas as pd
 
@@ -17,7 +18,7 @@ BASIC_RSI_LENGTH = 14
 SUPPORTED_EXCHANGES = {"binance", "coinbase", "kraken"}
 SUPPORTED_INTERVALS = {"1m", "5m", "15m", "1h", "4h", "1d"}
 
-# x402 config (off by default)
+# x402 config (off by default; Render env overrides these)
 X402_ENABLED = os.getenv("X402_ENABLED", "false").lower() == "true"
 X402_CHAIN = os.getenv("X402_CHAIN", "base-sepolia")
 X402_ASSET = os.getenv("X402_ASSET", "USDC")
@@ -43,13 +44,7 @@ def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     if df.empty:
         return df
     dfi = df.set_index("ts")
-    agg = {
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum",
-    }
+    agg = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     out = dfi.resample(rule, label="right", closed="right").agg(agg).dropna()
     return out.reset_index()
 
@@ -113,12 +108,8 @@ def _serialize_candles(df: pd.DataFrame):
 def compute_basic(df: pd.DataFrame) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     close = df["close"]
-
-    # SMA windows
     out["sma"] = {str(n): float(SMAIndicator(close=close, window=n).sma_indicator().iloc[-1])
                   for n in BASIC_SMA_WINDOWS}
-
-    # RSI
     rsi_val = float(RSIIndicator(close=close, window=BASIC_RSI_LENGTH).rsi().iloc[-1])
     out["rsi"] = {str(BASIC_RSI_LENGTH): rsi_val}
     return out
@@ -233,7 +224,7 @@ def indicators_basic(
 ):
     code, pay = maybe_require_payment("basic")
     if code:
-        return app.response_class(status_code=code, media_type="application/json", content=json.dumps(pay))
+        return JSONResponse(status_code=code, content=pay)
     df = fetch_ohlcv(symbol, interval, limit, exchange)
     return {"meta": meta(df, symbol, exchange, interval), "latest": compute_basic(df)}
 
@@ -247,7 +238,7 @@ def indicators_pro(
 ):
     code, pay = maybe_require_payment("pro")
     if code:
-        return app.response_class(status_code=code, media_type="application/json", content=json.dumps(pay))
+        return JSONResponse(status_code=code, content=pay)
     df = fetch_ohlcv(symbol, interval, limit, exchange)
     return {"meta": meta(df, symbol, exchange, interval), "latest": compute_pro(df)}
 
@@ -262,7 +253,7 @@ def get_candles(
 ):
     code, pay = maybe_require_payment("candles")
     if code:
-        return app.response_class(status_code=code, media_type="application/json", content=json.dumps(pay))
+        return JSONResponse(status_code=code, content=pay)
 
     df = fetch_ohlcv(symbol, interval, limit, exchange)
 
