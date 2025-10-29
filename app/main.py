@@ -194,6 +194,12 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
         "candles": "Raw OHLCV candles for charting.",
     }
 
+    # Normalize price to a number (x402scan requires numeric maxAmountRequired)
+    try:
+        amount_num = float(price)
+    except Exception:
+        amount_num = 0.0  # fallback to 0 to keep response typed; better than invalid string
+
     # Input schema (use only string/number/boolean)
     query_schema: Dict[str, Any] = {
         "symbol": {
@@ -213,7 +219,6 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
             "enum": sorted(list(SUPPORTED_INTERVALS)),
             "description": "Candle timeframe."
         },
-        # x402scan is picky: use "number" (not "integer")
         "limit": {
             "type": "number",
             "required": False,
@@ -274,13 +279,12 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
             }]
         }
 
-    # Normalize network
     network = "base" if X402_CHAIN in ("base", "base-sepolia") else "base"
 
     return {
         "scheme": "exact",
         "network": network,
-        "maxAmountRequired": str(price),
+        "maxAmountRequired": amount_num,  # <-- number, not string
         "resource": resource_url,
         "description": description_by_kind.get(kind, ""),
         "mimeType": "application/json",
@@ -297,7 +301,7 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
         },
         "extra": {"tier": kind}
     }
-
+    
 def _x402_response(kind: str, request: Request, price: str) -> Dict[str, Any]:
     # If not fully configured, return an error that x402scan can display cleanly
     if not X402_RECEIVER or not X402_ASSET or not X402_CHAIN:
