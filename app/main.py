@@ -194,18 +194,32 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
         "pro": "Pro indicators: Bollinger Bands, MACD, StochRSI, ATR, ADX, VWAP.",
         "candles": "Raw OHLCV candles for charting.",
     }
-    # Common input schema fields for all endpoints
-    query_schema = {
-        "symbol": {"type": "string", "required": True,
-                   "description": "Trading pair. Binance/Kraken: BTC/USDT. Coinbase: BTC-USD."},
-        "exchange": {"type": "string", "required": False,
-                     "enum": sorted(list(SUPPORTED_EXCHANGES)),
-                     "description": "Exchange to query."},
-        "interval": {"type": "string", "required": False,
-                     "enum": sorted(list(SUPPORTED_INTERVALS)),
-                     "description": "Candle timeframe."},
-        "limit": {"type": "integer", "required": False,
-                  "description": "Number of candles to fetch/calculations window (1–2000)."},
+
+    # ---- Input schema (FieldDef) ----
+    query_schema: Dict[str, Any] = {
+        "symbol": {
+            "type": "string",
+            "required": True,
+            "description": "Trading pair. Binance/Kraken: BTC/USDT. Coinbase: BTC-USD."
+        },
+        "exchange": {
+            "type": "string",
+            "required": False,
+            "enum": sorted(list(SUPPORTED_EXCHANGES)),
+            "description": "Exchange to query."
+        },
+        "interval": {
+            "type": "string",
+            "required": False,
+            "enum": sorted(list(SUPPORTED_INTERVALS)),
+            "description": "Candle timeframe."
+        },
+        # IMPORTANT: x402scan expects number here, not 'integer'
+        "limit": {
+            "type": "number",
+            "required": False,
+            "description": "Number of candles to fetch/calculations window (1–2000)."
+        },
     }
 
     output_schema: Dict[str, Any]
@@ -217,10 +231,10 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
                 "symbol": "string",
                 "exchange": "string",
                 "interval": "string",
-                "candles": "integer",
+                "candles": "number",
                 "last_candle_iso": "string|null",
             },
-            "latest": {}  # varies by kind; left open
+            "latest": {}
         }
         if kind == "basic":
             output_schema["latest"] = {
@@ -237,9 +251,11 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
                 "adx": {"adx": "number", "+di": "number", "-di": "number"},
                 "vwap": "number"
             }
-    else:  # candles
+    else:
+        # Candles endpoint: add resample to input schema
         query_schema["resample"] = {
-            "type": "string", "required": False,
+            "type": "string",
+            "required": False,
             "enum": sorted(list(SUPPORTED_INTERVALS)),
             "description": "Optional server-side aggregation of fetched candles."
         }
@@ -249,7 +265,7 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
                 "exchange": "string",
                 "interval": "string",
                 "returned_interval": "string",
-                "candles": "integer",
+                "candles": "number",
                 "last_candle_iso": "string|null",
             },
             "candles": [{
@@ -281,19 +297,6 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
             "output": output_schema
         },
         "extra": {"tier": kind}
-    }
-
-def _x402_response(kind: str, request: Request, price: str) -> Dict[str, Any]:
-    # If not fully configured, tell the validator why
-    if not X402_RECEIVER or not X402_ASSET or not X402_CHAIN:
-        return {
-            "x402Version": 1,
-            "error": "x402 not configured: set X402_RECEIVER, X402_ASSET, X402_CHAIN",
-        }
-    return {
-        "x402Version": 1,
-        "accepts": [_x402_accepts(kind, request, price)]
-        # "payer": "<optional-address>"  # omit unless you want to specify
     }
 
 def maybe_require_payment(kind: str, request: Request):
