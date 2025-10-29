@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+ccxt
+pandas>=2.2,<3
+ta
+python-dotenv
+numpy
