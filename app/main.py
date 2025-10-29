@@ -1,7 +1,7 @@
 import json, os
 from typing import Dict, Any
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import Response
 import ccxt
 import pandas as pd
 
@@ -20,7 +20,7 @@ SUPPORTED_INTERVALS = {"1m", "5m", "15m", "1h", "4h", "1d"}
 
 # x402 config (Render env overrides these)
 X402_ENABLED = os.getenv("X402_ENABLED", "false").lower() == "true"
-X402_CHAIN = os.getenv("X402_CHAIN", "base")  # default mainnet base
+X402_CHAIN = os.getenv("X402_CHAIN", "base")  # base mainnet by default
 X402_ASSET = os.getenv("X402_ASSET", "USDC")
 X402_RECEIVER = os.getenv("X402_RECEIVER", "")
 X402_PRICE_BASIC = os.getenv("X402_PRICE_BASIC", "0.005")
@@ -75,7 +75,6 @@ def fetch_ohlcv(symbol: str, interval: str, limit: int, exchange_name: str) -> p
     try:
         candles = ex.fetch_ohlcv(symbol, timeframe=fetch_interval, limit=fetch_limit)
     except Exception as e:
-        # Nice error for region block
         msg = str(e)
         if "451" in msg or "restricted location" in msg.lower():
             raise HTTPException(403, "Exchange blocked from this server location. Try exchange=kraken or coinbase.")
@@ -175,7 +174,7 @@ def compute_pro(df: pd.DataFrame) -> Dict[str, Any]:
 
     return out
 
-# ---- Meta + Payment ----
+# ---- Meta ----
 def meta(df: pd.DataFrame, symbol: str, exchange: str, interval: str):
     return {
         "symbol": symbol,
@@ -185,17 +184,17 @@ def meta(df: pd.DataFrame, symbol: str, exchange: str, interval: str):
         "last_candle_iso": df["ts"].iloc[-1].isoformat() if len(df) else None,
     }
 
-# ---------- x402scan Strict 402 Builder ----------
+# ---------- x402scan Strict 402 ----------
 def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
     """Build a strict x402scan 'accepts' entry for the requested endpoint."""
-    resource_url = str(request.url)  # full URL with query
+    resource_url = str(request.url)  # full URL with query, so their UI can replay it
     description_by_kind = {
         "basic": "Basic indicators: SMA(10/20/50/200), RSI(14).",
         "pro": "Pro indicators: Bollinger Bands, MACD, StochRSI, ATR, ADX, VWAP.",
         "candles": "Raw OHLCV candles for charting.",
     }
 
-    # ---- Input schema (FieldDef) ----
+    # Input schema (use only string/number/boolean)
     query_schema: Dict[str, Any] = {
         "symbol": {
             "type": "string",
@@ -214,7 +213,7 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
             "enum": sorted(list(SUPPORTED_INTERVALS)),
             "description": "Candle timeframe."
         },
-        # IMPORTANT: x402scan expects number here, not 'integer'
+        # x402scan is picky: use "number" (not "integer")
         "limit": {
             "type": "number",
             "required": False,
@@ -223,8 +222,6 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
     }
 
     output_schema: Dict[str, Any]
-    mime = "application/json"
-
     if kind in ("basic", "pro"):
         output_schema = {
             "meta": {
@@ -252,7 +249,6 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
                 "vwap": "number"
             }
     else:
-        # Candles endpoint: add resample to input schema
         query_schema["resample"] = {
             "type": "string",
             "required": False,
@@ -278,13 +274,16 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
             }]
         }
 
+    # Normalize network
+    network = "base" if X402_CHAIN in ("base", "base-sepolia") else "base"
+
     return {
         "scheme": "exact",
-        "network": X402_CHAIN if X402_CHAIN in ("base", "base-sepolia") else "base",
+        "network": network,
         "maxAmountRequired": str(price),
         "resource": resource_url,
         "description": description_by_kind.get(kind, ""),
-        "mimeType": mime,
+        "mimeType": "application/json",
         "payTo": X402_RECEIVER,
         "maxTimeoutSeconds": 300,
         "asset": X402_ASSET,
@@ -299,7 +298,20 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
         "extra": {"tier": kind}
     }
 
+def _x402_response(kind: str, request: Request, price: str) -> Dict[str, Any]:
+    # If not fully configured, return an error that x402scan can display cleanly
+    if not X402_RECEIVER or not X402_ASSET or not X402_CHAIN:
+        return {
+            "x402Version": 1,
+            "error": "x402 not configured: set X402_RECEIVER, X402_ASSET, X402_CHAIN",
+        }
+    return {
+        "x402Version": 1,
+        "accepts": [_x402_accepts(kind, request, price)]
+    }
+
 def maybe_require_payment(kind: str, request: Request):
+    """Return (status_code, body_or_none). If x402 is enabled, short-circuit with a strict 402 JSON body."""
     if not X402_ENABLED:
         return (None, None)
     if kind == "basic":
@@ -325,9 +337,11 @@ def indicators_basic(
     interval: str = Query("1h", description="1m,5m,15m,1h,4h,1d"),
     limit: int = Query(500, ge=100, le=2000),
 ):
+    # Return 402 before any data fetch when x402 is enabled
     code, pay = maybe_require_payment("basic", request)
     if code:
-        return JSONResponse(status_code=code, content=pay)
+        return Response(status_code=code, content=json.dumps(pay), media_type="application/json")
+
     df = fetch_ohlcv(symbol, interval, limit, exchange)
     return {"meta": meta(df, symbol, exchange, interval), "latest": compute_basic(df)}
 
@@ -341,7 +355,8 @@ def indicators_pro(
 ):
     code, pay = maybe_require_payment("pro", request)
     if code:
-        return JSONResponse(status_code=code, content=pay)
+        return Response(status_code=code, content=json.dumps(pay), media_type="application/json")
+
     df = fetch_ohlcv(symbol, interval, limit, exchange)
     return {"meta": meta(df, symbol, exchange, interval), "latest": compute_pro(df)}
 
@@ -356,7 +371,7 @@ def get_candles(
 ):
     code, pay = maybe_require_payment("candles", request)
     if code:
-        return JSONResponse(status_code=code, content=pay)
+        return Response(status_code=code, content=json.dumps(pay), media_type="application/json")
 
     df = fetch_ohlcv(symbol, interval, limit, exchange)
 
