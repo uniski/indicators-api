@@ -1,12 +1,15 @@
-import json, os
+# app/main.py
+
+import os, json
 from typing import Dict, Any
 from decimal import Decimal, InvalidOperation
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import Response
+
 import ccxt
 import pandas as pd
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import Response
 
-# ta indicators
+# ---- TA indicators
 from ta.momentum import RSIIndicator, StochRSIIndicator
 from ta.trend import SMAIndicator, ADXIndicator, MACD
 from ta.volatility import BollingerBands, AverageTrueRange
@@ -21,7 +24,7 @@ SUPPORTED_INTERVALS = {"1m", "5m", "15m", "1h", "4h", "1d"}
 
 # x402 config (Render env overrides these)
 X402_ENABLED = os.getenv("X402_ENABLED", "false").lower() == "true"
-X402_CHAIN = os.getenv("X402_CHAIN", "base")  # base mainnet by default
+X402_CHAIN = os.getenv("X402_CHAIN", "base")     # base mainnet by default
 X402_ASSET = os.getenv("X402_ASSET", "USDC")
 X402_RECEIVER = os.getenv("X402_RECEIVER", "")
 X402_PRICE_BASIC = os.getenv("X402_PRICE_BASIC", "0.005")
@@ -37,9 +40,11 @@ def _ensure_inputs(symbol: str, exchange: str, interval: str):
     if interval not in SUPPORTED_INTERVALS:
         raise HTTPException(400, f"interval must be one of {sorted(SUPPORTED_INTERVALS)}")
     if not isinstance(symbol, str) or ("/" not in symbol and "-" not in symbol):
-        pass  # basic sanity
+        # basic sanity; exact symbol format is validated by the exchange
+        pass
 
 def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """Resample OHLCV to a higher timeframe using OHLCV aggregation."""
     if df.empty:
         return df
     dfi = df.set_index("ts")
@@ -48,9 +53,15 @@ def _resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return out.reset_index()
 
 def fetch_ohlcv(symbol: str, interval: str, limit: int, exchange_name: str) -> pd.DataFrame:
+    """
+    Fetch OHLCV candles (timestamp, open, high, low, close, volume)
+    from supported exchanges. Auto-resamples Coinbase 4h from 1h.
+    """
     _ensure_inputs(symbol, exchange_name, interval)
+
     if not hasattr(ccxt, exchange_name):
         raise HTTPException(400, f"Unknown exchange '{exchange_name}'")
+
     ex = getattr(ccxt, exchange_name)()
     if not ex.has.get("fetchOHLCV", False):
         raise HTTPException(400, f"Exchange '{exchange_name}' does not support fetchOHLCV")
@@ -60,6 +71,7 @@ def fetch_ohlcv(symbol: str, interval: str, limit: int, exchange_name: str) -> p
         fetch_interval, post_resample = "1h", "4H"
 
     fetch_limit = limit * (4 if post_resample else 1)
+
     try:
         candles = ex.fetch_ohlcv(symbol, timeframe=fetch_interval, limit=fetch_limit)
     except Exception as e:
@@ -148,6 +160,7 @@ def compute_pro(df: pd.DataFrame) -> Dict[str, Any]:
         out["vwap"] = float(vwap)
     except Exception:
         pass
+
     return out
 
 # ---- Meta ----
@@ -160,7 +173,26 @@ def meta(df: pd.DataFrame, symbol: str, exchange: str, interval: str):
         "last_candle_iso": df["ts"].iloc[-1].isoformat() if len(df) else None,
     }
 
-# ---------- x402scan Strict 402 ----------
+# ---------- x402 helpers ----------
+def _normalize_amount(price: str) -> str:
+    """
+    Sanitize env-provided price into a strict decimal STRING for x402scan:
+    - strips stray quotes/spaces
+    - parses as Decimal
+    - must be > 0
+    - formats as 6-decimal string (no exponent)
+    """
+    s = str(price).strip()
+    if s.startswith(("'", '"')) and s.endswith(("'", '"')) and len(s) >= 2:
+        s = s[1:-1].strip()
+    try:
+        d = Decimal(s)
+    except (InvalidOperation, ValueError, TypeError):
+        raise HTTPException(500, "Invalid x402 price format")
+    if d <= 0:
+        raise HTTPException(500, "x402 price must be > 0")
+    return f"{d:.6f}"
+
 def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
     resource_url = str(request.url)
     description_by_kind = {
@@ -169,43 +201,44 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
         "candles": "Raw OHLCV candles for charting.",
     }
 
-    # Ensure string for maxAmountRequired
-    try:
-        q = Decimal(str(price)).quantize(Decimal("0.000001"))
-        amount_str = format(q.normalize(), "f")
-    except (InvalidOperation, ValueError, TypeError):
-        amount_str = str(price)
+    amount_str = _normalize_amount(price)
 
     query_schema = {
         "symbol": {"type": "string", "required": True, "description": "Trading pair"},
         "exchange": {"type": "string", "required": False, "enum": sorted(list(SUPPORTED_EXCHANGES))},
         "interval": {"type": "string", "required": False, "enum": sorted(list(SUPPORTED_INTERVALS))},
-        "limit": {"type": "number", "required": False, "description": "1–2000"}
-    }
-
-    output_schema = {
-        "meta": {"symbol": "string", "exchange": "string", "interval": "string", "candles": "number", "last_candle_iso": "string|null"},
-        "latest": {}
+        "limit": {"type": "number", "required": False, "description": "1–2000"},
     }
 
     if kind == "basic":
-        output_schema["latest"] = {"sma": {"10": "number", "20": "number", "50": "number", "200": "number"}, "rsi": {"14": "number"}}
-    elif kind == "pro":
-        output_schema["latest"] = {
-            "bb": {"basis": "number", "upper": "number", "lower": "number", "bandwidth": "number", "percentB": "number"},
-            "macd": {"macd": "number", "signal": "number", "hist": "number"},
-            "stoch_rsi": {"k": "number", "d": "number"},
-            "atr": {"14": "number"},
-            "adx": {"adx": "number", "+di": "number", "-di": "number"},
-            "vwap": "number"
+        output_schema = {
+            "meta": {"symbol": "string", "exchange": "string", "interval": "string", "candles": "number", "last_candle_iso": "string|null"},
+            "latest": {"sma": {"10": "number", "20": "number", "50": "number", "200": "number"}, "rsi": {"14": "number"}},
         }
-    else:
-        output_schema = {"candles": [{"ts": "string", "open": "number", "high": "number", "low": "number", "close": "number", "volume": "number"}]}
+    elif kind == "pro":
+        output_schema = {
+            "meta": {"symbol": "string", "exchange": "string", "interval": "string", "candles": "number", "last_candle_iso": "string|null"},
+            "latest": {
+                "bb": {"basis": "number", "upper": "number", "lower": "number", "bandwidth": "number", "percentB": "number"},
+                "macd": {"macd": "number", "signal": "number", "hist": "number"},
+                "stoch_rsi": {"k": "number", "d": "number"},
+                "atr": {"14": "number"},
+                "adx": {"adx": "number", "+di": "number", "-di": "number"},
+                "vwap": "number",
+            },
+        }
+    else:  # candles
+        output_schema = {
+            "meta": {"symbol": "string", "exchange": "string", "interval": "string", "returned_interval": "string", "candles": "number", "last_candle_iso": "string|null"},
+            "candles": [{"ts": "string", "open": "number", "high": "number", "low": "number", "close": "number", "volume": "number"}],
+        }
+        # allow optional resample in input for /v1/candles
+        query_schema["resample"] = {"type": "string", "required": False, "enum": sorted(list(SUPPORTED_INTERVALS))}
 
     return {
         "scheme": "exact",
         "network": "base",
-        "maxAmountRequired": str(price),
+        "maxAmountRequired": amount_str,  # STRING per x402scan
         "resource": resource_url,
         "description": description_by_kind.get(kind, ""),
         "mimeType": "application/json",
@@ -213,12 +246,12 @@ def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
         "maxTimeoutSeconds": 300,
         "asset": X402_ASSET,
         "outputSchema": {"input": {"type": "http", "method": "GET", "queryParams": query_schema}, "output": output_schema},
-        "extra": {"tier": kind}
+        "extra": {"tier": kind},
     }
 
 def _x402_response(kind: str, request: Request, price: str) -> Dict[str, Any]:
     if not X402_RECEIVER or not X402_ASSET or not X402_CHAIN:
-        return {"x402Version": 1, "error": "x402 not configured"}
+        return {"x402Version": 1, "error": "x402 not configured: set X402_RECEIVER, X402_ASSET, X402_CHAIN"}
     return {"x402Version": 1, "accepts": [_x402_accepts(kind, request, price)]}
 
 def maybe_require_payment(kind: str, request: Request):
@@ -233,7 +266,13 @@ def health():
     return {"ok": True}
 
 @app.get("/v1/indicators/basic")
-def indicators_basic(request: Request, symbol: str, exchange: str = "binance", interval: str = "1h", limit: int = 500):
+def indicators_basic(
+    request: Request,
+    symbol: str = Query(..., description="Binance: BTC/USDT, Coinbase: BTC-USD, Kraken: BTC/USDT"),
+    exchange: str = Query("binance"),
+    interval: str = Query("1h"),
+    limit: int = Query(500, ge=1, le=2000),
+):
     code, pay = maybe_require_payment("basic", request)
     if code:
         return Response(status_code=code, content=json.dumps(pay), media_type="application/json")
@@ -241,7 +280,13 @@ def indicators_basic(request: Request, symbol: str, exchange: str = "binance", i
     return {"meta": meta(df, symbol, exchange, interval), "latest": compute_basic(df)}
 
 @app.get("/v1/indicators/pro")
-def indicators_pro(request: Request, symbol: str, exchange: str = "binance", interval: str = "1h", limit: int = 500):
+def indicators_pro(
+    request: Request,
+    symbol: str = Query(...),
+    exchange: str = Query("binance"),
+    interval: str = Query("1h"),
+    limit: int = Query(500, ge=1, le=2000),
+):
     code, pay = maybe_require_payment("pro", request)
     if code:
         return Response(status_code=code, content=json.dumps(pay), media_type="application/json")
@@ -249,7 +294,14 @@ def indicators_pro(request: Request, symbol: str, exchange: str = "binance", int
     return {"meta": meta(df, symbol, exchange, interval), "latest": compute_pro(df)}
 
 @app.get("/v1/candles")
-def get_candles(request: Request, symbol: str, exchange: str = "binance", interval: str = "1h", limit: int = 500, resample: str | None = None):
+def get_candles(
+    request: Request,
+    symbol: str = Query(..., description="Binance: BTC/USDT, Coinbase: BTC-USD, Kraken: BTC/USDT"),
+    exchange: str = Query("binance"),
+    interval: str = Query("1h"),
+    limit: int = Query(500, ge=1, le=2000),
+    resample: str | None = Query(None, description="Optional: 1m,5m,15m,1h,4h,1d to aggregate server-side"),
+):
     code, pay = maybe_require_payment("candles", request)
     if code:
         return Response(status_code=code, content=json.dumps(pay), media_type="application/json")
