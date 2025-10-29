@@ -18,9 +18,9 @@ BASIC_RSI_LENGTH = 14
 SUPPORTED_EXCHANGES = {"binance", "coinbase", "kraken"}
 SUPPORTED_INTERVALS = {"1m", "5m", "15m", "1h", "4h", "1d"}
 
-# x402 config (off by default; Render env overrides these)
+# x402 config (Render env overrides these)
 X402_ENABLED = os.getenv("X402_ENABLED", "false").lower() == "true"
-X402_CHAIN = os.getenv("X402_CHAIN", "base-sepolia")
+X402_CHAIN = os.getenv("X402_CHAIN", "base")  # default mainnet base
 X402_ASSET = os.getenv("X402_ASSET", "USDC")
 X402_RECEIVER = os.getenv("X402_RECEIVER", "")
 X402_PRICE_BASIC = os.getenv("X402_PRICE_BASIC", "0.005")
@@ -75,6 +75,10 @@ def fetch_ohlcv(symbol: str, interval: str, limit: int, exchange_name: str) -> p
     try:
         candles = ex.fetch_ohlcv(symbol, timeframe=fetch_interval, limit=fetch_limit)
     except Exception as e:
+        # Nice error for region block
+        msg = str(e)
+        if "451" in msg or "restricted location" in msg.lower():
+            raise HTTPException(403, "Exchange blocked from this server location. Try exchange=kraken or coinbase.")
         raise HTTPException(400, f"CCXT error: {e}")
 
     if not candles:
@@ -181,22 +185,118 @@ def meta(df: pd.DataFrame, symbol: str, exchange: str, interval: str):
         "last_candle_iso": df["ts"].iloc[-1].isoformat() if len(df) else None,
     }
 
-def x402_requirements(price: str):
-    if not (X402_RECEIVER and X402_ASSET and X402_CHAIN):
-        raise HTTPException(500, "x402 not configured: set X402_RECEIVER, X402_ASSET, X402_CHAIN")
-    return {
-        "version": "1.0",
-        "payment": {
-            "chain": X402_CHAIN,
-            "asset": X402_ASSET,
-            "receiver": X402_RECEIVER,
-            "amount": price,
-            "currency": "USDC",
-            "expires_in": 300,
-        },
+# ---------- x402scan Strict 402 Builder ----------
+def _x402_accepts(kind: str, request: Request, price: str) -> Dict[str, Any]:
+    """Build a strict x402scan 'accepts' entry for the requested endpoint."""
+    resource_url = str(request.url)  # full URL with query
+    description_by_kind = {
+        "basic": "Basic indicators: SMA(10/20/50/200), RSI(14).",
+        "pro": "Pro indicators: Bollinger Bands, MACD, StochRSI, ATR, ADX, VWAP.",
+        "candles": "Raw OHLCV candles for charting.",
+    }
+    # Common input schema fields for all endpoints
+    query_schema = {
+        "symbol": {"type": "string", "required": True,
+                   "description": "Trading pair. Binance/Kraken: BTC/USDT. Coinbase: BTC-USD."},
+        "exchange": {"type": "string", "required": False,
+                     "enum": sorted(list(SUPPORTED_EXCHANGES)),
+                     "description": "Exchange to query."},
+        "interval": {"type": "string", "required": False,
+                     "enum": sorted(list(SUPPORTED_INTERVALS)),
+                     "description": "Candle timeframe."},
+        "limit": {"type": "integer", "required": False,
+                  "description": "Number of candles to fetch/calculations window (1–2000)."},
     }
 
-def maybe_require_payment(kind: str):
+    output_schema: Dict[str, Any]
+    mime = "application/json"
+
+    if kind in ("basic", "pro"):
+        output_schema = {
+            "meta": {
+                "symbol": "string",
+                "exchange": "string",
+                "interval": "string",
+                "candles": "integer",
+                "last_candle_iso": "string|null",
+            },
+            "latest": {}  # varies by kind; left open
+        }
+        if kind == "basic":
+            output_schema["latest"] = {
+                "sma": {"10": "number", "20": "number", "50": "number", "200": "number"},
+                "rsi": {"14": "number"},
+            }
+        else:
+            output_schema["latest"] = {
+                "bb": {"basis": "number", "upper": "number", "lower": "number",
+                       "bandwidth": "number", "percentB": "number"},
+                "macd": {"macd": "number", "signal": "number", "hist": "number"},
+                "stoch_rsi": {"k": "number", "d": "number"},
+                "atr": {"14": "number"},
+                "adx": {"adx": "number", "+di": "number", "-di": "number"},
+                "vwap": "number"
+            }
+    else:  # candles
+        query_schema["resample"] = {
+            "type": "string", "required": False,
+            "enum": sorted(list(SUPPORTED_INTERVALS)),
+            "description": "Optional server-side aggregation of fetched candles."
+        }
+        output_schema = {
+            "meta": {
+                "symbol": "string",
+                "exchange": "string",
+                "interval": "string",
+                "returned_interval": "string",
+                "candles": "integer",
+                "last_candle_iso": "string|null",
+            },
+            "candles": [{
+                "ts": "string",
+                "open": "number",
+                "high": "number",
+                "low": "number",
+                "close": "number",
+                "volume": "number"
+            }]
+        }
+
+    return {
+        "scheme": "exact",
+        "network": X402_CHAIN if X402_CHAIN in ("base", "base-sepolia") else "base",
+        "maxAmountRequired": str(price),
+        "resource": resource_url,
+        "description": description_by_kind.get(kind, ""),
+        "mimeType": mime,
+        "payTo": X402_RECEIVER,
+        "maxTimeoutSeconds": 300,
+        "asset": X402_ASSET,
+        "outputSchema": {
+            "input": {
+                "type": "http",
+                "method": "GET",
+                "queryParams": query_schema
+            },
+            "output": output_schema
+        },
+        "extra": {"tier": kind}
+    }
+
+def _x402_response(kind: str, request: Request, price: str) -> Dict[str, Any]:
+    # If not fully configured, tell the validator why
+    if not X402_RECEIVER or not X402_ASSET or not X402_CHAIN:
+        return {
+            "x402Version": 1,
+            "error": "x402 not configured: set X402_RECEIVER, X402_ASSET, X402_CHAIN",
+        }
+    return {
+        "x402Version": 1,
+        "accepts": [_x402_accepts(kind, request, price)]
+        # "payer": "<optional-address>"  # omit unless you want to specify
+    }
+
+def maybe_require_payment(kind: str, request: Request):
     if not X402_ENABLED:
         return (None, None)
     if kind == "basic":
@@ -207,7 +307,7 @@ def maybe_require_payment(kind: str):
         price = X402_PRICE_CANDLES
     else:
         price = X402_PRICE_BASIC
-    return (402, x402_requirements(price))
+    return (402, _x402_response(kind, request, price))
 
 # ---------- Endpoints ----------
 @app.get("/health")
@@ -222,7 +322,7 @@ def indicators_basic(
     interval: str = Query("1h", description="1m,5m,15m,1h,4h,1d"),
     limit: int = Query(500, ge=100, le=2000),
 ):
-    code, pay = maybe_require_payment("basic")
+    code, pay = maybe_require_payment("basic", request)
     if code:
         return JSONResponse(status_code=code, content=pay)
     df = fetch_ohlcv(symbol, interval, limit, exchange)
@@ -236,7 +336,7 @@ def indicators_pro(
     interval: str = Query("1h"),
     limit: int = Query(500, ge=100, le=2000),
 ):
-    code, pay = maybe_require_payment("pro")
+    code, pay = maybe_require_payment("pro", request)
     if code:
         return JSONResponse(status_code=code, content=pay)
     df = fetch_ohlcv(symbol, interval, limit, exchange)
@@ -251,7 +351,7 @@ def get_candles(
     limit: int = Query(500, ge=1, le=2000),
     resample: str | None = Query(None, description="Optional: 1m,5m,15m,1h,4h,1d to aggregate server-side"),
 ):
-    code, pay = maybe_require_payment("candles")
+    code, pay = maybe_require_payment("candles", request)
     if code:
         return JSONResponse(status_code=code, content=pay)
 
